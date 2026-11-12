@@ -1,128 +1,575 @@
-from aiogram import Router,F,Bot
-from aiogram.filters import Command,CommandStart,CommandObject
-from aiogram.types import Message,CallbackQuery,InlineKeyboardMarkup,InlineKeyboardButton
-from bot.db import pool
-from bot.config import OWNER_ID,SUPPORT_USERNAME
-from bot.services.redis import new_captcha,check_captcha,captcha_cooldown,set_cooldown,lock,unlock
-from bot.services.channels import is_member
-from bot.services.logs import audit,discover
-router=Router()
+from aiogram import Router, F, Bot
+from aiogram.filters import Command, CommandStart, CommandObject
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 
-MENU=InlineKeyboardMarkup(inline_keyboard=[
- [InlineKeyboardButton(text="🎁 Browse Giveaways",callback_data="browse")],
- [InlineKeyboardButton(text="🚀 Create Giveaway",callback_data="host_create")],
- [InlineKeyboardButton(text="📊 My Entries",callback_data="my_entries")],
- [InlineKeyboardButton(text="🆘 Support",url=f"https://t.me/{SUPPORT_USERNAME}")]])
+from bot import db
+from bot.config import SUPPORT_USERNAME
+from bot.services.redis import (
+    new_captcha,
+    check_captcha,
+    captcha_cooldown,
+    set_cooldown,
+    lock,
+    unlock,
+)
+from bot.services.channels import is_member
+from bot.services.logs import audit, discover
+
+router = Router()
+
+MENU = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="🎁 Browse Giveaways",
+                callback_data="browse",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🚀 Create Giveaway",
+                callback_data="host_create",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="📊 My Entries",
+                callback_data="my_entries",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🆘 Support",
+                url=f"https://t.me/{SUPPORT_USERNAME}",
+            )
+        ],
+    ]
+)
+
 
 @router.message(CommandStart())
-async def start(m:Message,command:CommandObject):
-    async with pool.acquire() as c:
-        await c.execute("INSERT INTO users(tg_id,username,first_name) VALUES($1,$2,$3) ON CONFLICT(tg_id) DO UPDATE SET username=$2",m.from_user.id,m.from_user.username,m.from_user.first_name)
+async def start(message: Message, command: CommandObject):
+    async with db.pool.acquire() as connection:
+        await connection.execute(
+            """
+            INSERT INTO users (tg_id, username, first_name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (tg_id)
+            DO UPDATE SET username = $2
+            """,
+            message.from_user.id,
+            message.from_user.username,
+            message.from_user.first_name,
+        )
+
         if command.args and command.args.startswith("ref_"):
             try:
-                _,gid,ref=command.args.split("_"); gid,ref=int(gid),int(ref)
-                if ref!=m.from_user.id:
-                    await c.execute("INSERT INTO referrals(giveaway,referrer,invited) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",gid,ref,m.from_user.id)
-            except Exception: pass
-    await m.answer("🎉 <b>Welcome to GiveawayX</b>\nParticipate, refer friends, or host your own giveaway — no approval needed.",reply_markup=MENU)
+                _, giveaway_id, referrer_id = command.args.split("_")
+                giveaway_id = int(giveaway_id)
+                referrer_id = int(referrer_id)
 
-@router.callback_query(F.data=="browse")
-async def browse(cb:CallbackQuery):
-    async with pool.acquire() as c:
-        rows=await c.fetch("SELECT id,title,prize FROM giveaways WHERE status='active' AND ends>now() ORDER BY id DESC LIMIT 10")
-    if not rows: return await cb.message.edit_text("No active giveaways.")
-    kb=[[InlineKeyboardButton(text=f"🎁 {r['title']}",callback_data=f"view:{r['id']}")] for r in rows]
-    kb.append([InlineKeyboardButton(text="🔙 Back",callback_data="main")])
-    await cb.message.edit_text("🔥 <b>Active Giveaways</b>",reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+                if referrer_id != message.from_user.id:
+                    await connection.execute(
+                        """
+                        INSERT INTO referrals
+                        (giveaway, referrer, invited)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        giveaway_id,
+                        referrer_id,
+                        message.from_user.id,
+                    )
+            except Exception:
+                pass
 
-@router.callback_query(F.data=="main")
-async def main_menu(cb:CallbackQuery): await cb.message.edit_text("🎉 <b>Main Menu</b>",reply_markup=MENU)
+    await message.answer(
+        "🎉 <b>Welcome to GiveawayX</b>\n\n"
+        "Participate in giveaways, invite friends, or create your own giveaway.\n\n"
+        f"👤 User: @{message.from_user.username or message.from_user.first_name}\n"
+        f"🆔 ID: <code>{message.from_user.id}</code>",
+        reply_markup=MENU,
+    )
+
+
+@router.callback_query(F.data == "browse")
+async def browse(callback: CallbackQuery):
+    async with db.pool.acquire() as connection:
+        giveaways = await connection.fetch(
+            """
+            SELECT id, title, prize
+            FROM giveaways
+            WHERE status = 'active'
+            AND ends > now()
+            ORDER BY id DESC
+            LIMIT 10
+            """
+        )
+
+    if not giveaways:
+        return await callback.message.edit_text(
+            "No active giveaways right now."
+        )
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=f"🎁 {giveaway['title']}",
+                callback_data=f"view:{giveaway['id']}",
+            )
+        ]
+        for giveaway in giveaways
+    ]
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 Back",
+                callback_data="main",
+            )
+        ]
+    )
+
+    await callback.message.edit_text(
+        "🔥 <b>Active Giveaways</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data == "main")
+async def main_menu(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🎉 <b>Main Menu</b>",
+        reply_markup=MENU,
+    )
+
 
 @router.callback_query(F.data.startswith("view:"))
-async def view_cb(cb:CallbackQuery):
-    gid=int(cb.data.split(":")[1])
-    async with pool.acquire() as c:
-        g=await c.fetchrow("SELECT * FROM giveaways WHERE id=$1",gid)
-        chans=await c.fetch("SELECT * FROM giveaway_channels WHERE giveaway=$1",gid)
-    if not g: return await cb.answer("Not found",show_alert=True)
-    text=f"🎁 <b>{g['title']}</b>\n🏆 {g['prize']}\n👥 Winners: {g['winners']}\n🆔 #{gid}\n\n{g['description'] or ''}"
-    kb=[[InlineKeyboardButton(text="✅ Participate",callback_data=f"join:{gid}")]]
-    for ch in chans: kb.append([InlineKeyboardButton(text=f"📢 {ch['title'] or 'Join'}",url=ch["link"])])
-    kb.append([InlineKeyboardButton(text="🔙 Back",callback_data="browse")])
-    await cb.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+async def view_giveaway(callback: CallbackQuery):
+    giveaway_id = int(callback.data.split(":")[1])
+
+    async with db.pool.acquire() as connection:
+        giveaway = await connection.fetchrow(
+            "SELECT * FROM giveaways WHERE id = $1",
+            giveaway_id,
+        )
+
+        channels = await connection.fetch(
+            """
+            SELECT * FROM giveaway_channels
+            WHERE giveaway = $1
+            """,
+            giveaway_id,
+        )
+
+    if not giveaway:
+        return await callback.answer(
+            "Giveaway not found.",
+            show_alert=True,
+        )
+
+    text = (
+        f"🎁 <b>{giveaway['title']}</b>\n\n"
+        f"🏆 Prize: {giveaway['prize']}\n"
+        f"👥 Winners: {giveaway['winners']}\n"
+        f"🆔 Giveaway ID: <code>{giveaway['id']}</code>\n\n"
+        f"{giveaway['description'] or ''}"
+    )
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text="✅ Participate",
+                callback_data=f"join:{giveaway_id}",
+            )
+        ]
+    ]
+
+    for channel in channels:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"📢 {channel['title'] or 'Join Channel'}",
+                    url=channel["link"],
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 Back",
+                callback_data="browse",
+            )
+        ]
+    )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
 
 @router.callback_query(F.data.startswith("join:"))
-async def join_cb(cb:CallbackQuery,bot:Bot):
-    gid=int(cb.data.split(":")[1]); uid=cb.from_user.id
-    if not await lock(f"join:{gid}:{uid}"): return await cb.answer("Wait...",show_alert=True)
+async def join_giveaway(callback: CallbackQuery, bot: Bot):
+    giveaway_id = int(callback.data.split(":")[1])
+    user_id = callback.from_user.id
+
+    lock_key = f"join:{giveaway_id}:{user_id}"
+
+    if not await lock(lock_key):
+        return await callback.answer(
+            "Please wait...",
+            show_alert=True,
+        )
+
     try:
-        async with pool.acquire() as c:
-            g=await c.fetchrow("SELECT * FROM giveaways WHERE id=$1 AND status='active' AND ends>now()",gid)
-            chans=await c.fetch("SELECT * FROM giveaway_channels WHERE giveaway=$1 AND required",gid)
-            glob=await c.fetch("SELECT * FROM global_channels WHERE active")
-        if not g: return await cb.answer("Giveaway ended.",show_alert=True)
-        for ch in list(glob)+list(chans):
-            if not await is_member(bot,ch["chat_id"],uid):
-                return await cb.answer(f"Join {ch['title'] or ch['chat_id']} first.",show_alert=True)
-        if await captcha_cooldown(gid,uid): return await cb.answer("Captcha cooldown 10 min.",show_alert=True)
-        a,b=await new_captcha(gid,uid)
-        await cb.message.edit_text(f"🤖 Human check\n{a} + {b} = ?\nReply: /captcha {gid} ANSWER")
-    finally: await unlock(f"join:{gid}:{uid}")
+        async with db.pool.acquire() as connection:
+            giveaway = await connection.fetchrow(
+                """
+                SELECT * FROM giveaways
+                WHERE id = $1
+                AND status = 'active'
+                AND ends > now()
+                """,
+                giveaway_id,
+            )
+
+            channels = await connection.fetch(
+                """
+                SELECT * FROM giveaway_channels
+                WHERE giveaway = $1
+                AND required = TRUE
+                """,
+                giveaway_id,
+            )
+
+            global_channels = await connection.fetch(
+                """
+                SELECT * FROM global_channels
+                WHERE active = TRUE
+                """
+            )
+
+        if not giveaway:
+            return await callback.answer(
+                "Giveaway is not active.",
+                show_alert=True,
+            )
+
+        for channel in list(global_channels) + list(channels):
+            if not await is_member(
+                bot,
+                channel["chat_id"],
+                user_id,
+            ):
+                return await callback.answer(
+                    f"Join {channel['title'] or channel['chat_id']} first.",
+                    show_alert=True,
+                )
+
+        if await captcha_cooldown(giveaway_id, user_id):
+            return await callback.answer(
+                "Captcha cooldown active. Try again later.",
+                show_alert=True,
+            )
+
+        first_number, second_number = await new_captcha(
+            giveaway_id,
+            user_id,
+        )
+
+        await callback.message.edit_text(
+            "🤖 <b>Human Verification</b>\n\n"
+            f"Solve: <b>{first_number} + {second_number} = ?</b>\n\n"
+            f"Reply:\n<code>/captcha {giveaway_id} ANSWER</code>\n\n"
+            "⏳ Expires in 3 minutes."
+        )
+
+    finally:
+        await unlock(lock_key)
+
 
 @router.message(Command("captcha"))
-async def captcha(m:Message,command:CommandObject):
-    try: gid,ans=command.args.split(); gid=int(gid)
-    except Exception: return await m.answer("Usage: /captcha GID ANSWER")
-    if await captcha_cooldown(gid,m.from_user.id): return await m.answer("Cooldown active.")
-    if await check_captcha(gid,m.from_user.id,ans):
-        async with pool.acquire() as c:
-            await c.execute("INSERT INTO participants(giveaway,user_id,captcha) VALUES($1,$2,TRUE) ON CONFLICT(giveaway,user_id) DO UPDATE SET captcha=TRUE",gid,m.from_user.id)
-            # credit referrer if referral exists and now valid
-            ref=await c.fetchrow("SELECT referrer FROM referrals WHERE giveaway=$1 AND invited=$2 AND NOT valid",gid,m.from_user.id)
-            if ref:
-                await c.execute("UPDATE referrals SET valid=TRUE WHERE giveaway=$1 AND invited=$2",gid,m.from_user.id)
-                cnt=await c.fetchval("SELECT COUNT(*) FROM referrals WHERE giveaway=$1 AND referrer=$2 AND valid",gid,ref["referrer"])
-                cap=await c.fetchval("SELECT referral_cap FROM giveaways WHERE id=$1",gid)
-                if cnt<=cap:
-                    bonus=await c.fetchval("SELECT referral_bonus FROM giveaways WHERE id=$1",gid)
-                    await c.execute("UPDATE participants SET referral_entries=referral_entries+$2,total_entries=total_entries+$2 WHERE giveaway=$1 AND user_id=$3",gid,bonus,ref["referrer"])
-        await m.answer(f"✅ Verified! Use /requirements {gid} for bonus tasks.")
-    else: await m.answer("❌ Wrong/expired captcha. /join again.")
+async def captcha(message: Message, command: CommandObject):
+    try:
+        giveaway_id, answer = command.args.split()
+        giveaway_id = int(giveaway_id)
+    except Exception:
+        return await message.answer(
+            "Usage: /captcha GIVEAWAY_ID ANSWER"
+        )
 
-@router.message(Command("requirements","recheck"))
-async def requirements(m:Message,command:CommandObject):
-    gid=int(command.args or 0)
-    async with pool.acquire() as c:
-        g=await c.fetchrow("SELECT * FROM giveaways WHERE id=$1",gid)
-        p=await c.fetchrow("SELECT * FROM participants WHERE giveaway=$1 AND user_id=$2",gid,m.from_user.id)
-        bonuses=await c.fetch("SELECT * FROM bonus_tasks WHERE giveaway=$1 AND active",gid) if False else []
-    if not g or not p: return await m.answer("Join first: /join "+str(gid))
-    lines=[f"📋 <b>{g['title']}</b>",f"🎯 Entries: {p['total_entries']}",
-           f"💬 Chat: {p['messages']}/{g['chat_target'] or 0}"+(" (mandatory)" if g['chat_target'] else " (none)"),
-           f"🤖 Captcha: {'✅' if p['captcha'] else '❌'}"]
-    if g['bio_bonus']: lines.append(f"📝 Bio bonus: add {g['bio_bonus']} (+1)")
-    if g['name_bonus']: lines.append(f"🏷 Name bonus: add {g['name_bonus']} (+1)")
-    if g['referral_bonus']: lines.append(f"👥 Referrals: +{g['referral_bonus']} per valid friend (cap {g['referral_cap']})")
-    me=await m.bot.me()
-    lines.append(f"\n🔗 Referral link:\nhttps://t.me/{me.username}?start=ref_{gid}_{m.from_user.id}")
-    await m.answer("\n".join(lines),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Recheck",callback_data=f"recheck:{gid}")]]))
+    if await captcha_cooldown(giveaway_id, message.from_user.id):
+        return await message.answer(
+            "⏳ Captcha cooldown active. Try again later."
+        )
+
+    if await check_captcha(
+        giveaway_id,
+        message.from_user.id,
+        answer,
+    ):
+        async with db.pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO participants
+                (giveaway, user_id, captcha)
+                VALUES ($1, $2, TRUE)
+                ON CONFLICT (giveaway, user_id)
+                DO UPDATE SET captcha = TRUE
+                """,
+                giveaway_id,
+                message.from_user.id,
+            )
+
+            referral = await connection.fetchrow(
+                """
+                SELECT referrer
+                FROM referrals
+                WHERE giveaway = $1
+                AND invited = $2
+                AND valid = FALSE
+                """,
+                giveaway_id,
+                message.from_user.id,
+            )
+
+            if referral:
+                await connection.execute(
+                    """
+                    UPDATE referrals
+                    SET valid = TRUE
+                    WHERE giveaway = $1
+                    AND invited = $2
+                    """,
+                    giveaway_id,
+                    message.from_user.id,
+                )
+
+                referral_count = await connection.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM referrals
+                    WHERE giveaway = $1
+                    AND referrer = $2
+                    AND valid = TRUE
+                    """,
+                    giveaway_id,
+                    referral["referrer"],
+                )
+
+                giveaway = await connection.fetchrow(
+                    "SELECT * FROM giveaways WHERE id = $1",
+                    giveaway_id,
+                )
+
+                if referral_count <= giveaway["referral_cap"]:
+                    await connection.execute(
+                        """
+                        UPDATE participants
+                        SET referral_entries = referral_entries + $2,
+                        total_entries = total_entries + $2
+                        WHERE giveaway = $1
+                        AND user_id = $3
+                        """,
+                        giveaway_id,
+                        giveaway["referral_bonus"],
+                        referral["referrer"],
+                    )
+
+        await message.answer(
+            "✅ <b>Captcha verified!</b>\n\n"
+            "You are now participating.\n\n"
+            f"Use /requirements {giveaway_id} to view bonus entries."
+        )
+
+    else:
+        await message.answer(
+            "❌ Wrong or expired captcha.\n\n"
+            "Use /join again."
+        )
+
+
+@router.message(Command("requirements", "recheck"))
+async def requirements(message: Message, command: CommandObject):
+    giveaway_id = int(command.args or 0)
+
+    async with db.pool.acquire() as connection:
+        giveaway = await connection.fetchrow(
+            "SELECT * FROM giveaways WHERE id = $1",
+            giveaway_id,
+        )
+
+        participant = await connection.fetchrow(
+            """
+            SELECT * FROM participants
+            WHERE giveaway = $1
+            AND user_id = $2
+            """,
+            giveaway_id,
+            message.from_user.id,
+        )
+
+    if not giveaway or not participant:
+        return await message.answer(
+            "You are not participating in this giveaway."
+        )
+
+    bot_username = (await message.bot.me()).username
+
+    referral_link = (
+        f"https://t.me/{bot_username}"
+        f"?start=ref_{giveaway_id}_{message.from_user.id}"
+    )
+
+    text = (
+        f"📋 <b>{giveaway['title']}</b>\n\n"
+        f"🎯 Your entries: <b>{participant['total_entries']}</b>\n\n"
+        f"💬 Chat activity: "
+        f"{participant['messages']}/{giveaway['chat_target'] or 0}\n"
+        f"🤖 Captcha: "
+        f"{'✅ Verified' if participant['captcha'] else '❌ Not verified'}\n\n"
+    )
+
+    if giveaway["bio_bonus"]:
+        text += (
+            f"📝 Bio bonus: add <code>{giveaway['bio_bonus']}</code>\n"
+            f"Reward: +1 entry\n\n"
+        )
+
+    if giveaway["name_bonus"]:
+        text += (
+            f"🏷 Name bonus: add <code>{giveaway['name_bonus']}</code>\n"
+            f"Reward: +1 entry\n\n"
+        )
+
+    if giveaway["referral_bonus"]:
+        text += (
+            f"👥 Referrals: +{giveaway['referral_bonus']} per valid friend\n"
+            f"Referral cap: {giveaway['referral_cap']}\n\n"
+            f"🔗 Your referral link:\n{referral_link}"
+        )
+
+    await message.answer(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🔄 Recheck Bonus Entries",
+                        callback_data=f"recheck:{giveaway_id}",
+                    )
+                ]
+            ]
+        ),
+    )
+
 
 @router.callback_query(F.data.startswith("recheck:"))
-async def recheck(cb:CallbackQuery):
-    gid=int(cb.data.split(":")[1])
-    async with pool.acquire() as c:
-        g=await c.fetchrow("SELECT * FROM giveaways WHERE id=$1",gid)
-        p=await c.fetchrow("SELECT * FROM participants WHERE giveaway=$1 AND user_id=$2",gid,cb.from_user.id)
-    if not g or not p: return await cb.answer("Not participating.",show_alert=True)
-    profile=await cb.bot.get_chat(cb.from_user.id)
-    full=" ".join(filter(None,[profile.first_name,profile.last_name]))
-    bonus=int(bool(g["bio_bonus"]) and g["bio_bonus"].casefold() in (profile.bio or "").casefold())+int(bool(g["name_bonus"]) and g["name_bonus"].casefold() in full.casefold())
-    async with pool.acquire() as c:
-        await c.execute("UPDATE participants SET bonus=$3,total_entries=1+$3+referral_entries WHERE giveaway=$1 AND user_id=$2",gid,cb.from_user.id,bonus)
-    await cb.message.edit_text(f"✅ Bonus updated. Total entries: {1+bonus+p['referral_entries']}")
+async def recheck(callback: CallbackQuery):
+    giveaway_id = int(callback.data.split(":")[1])
 
-@router.callback_query(F.data=="my_entries")
-async def my_entries(cb:CallbackQuery):
-    async with pool.acquire() as c:
-        rows=await c.fetch("SELECT giveaway,total_entries FROM participants WHERE user_id=$1",cb.from_user.id)
-    await cb.message.edit_text("📊 <b>My Entries</b>\n"+("\n".join(f"#{r['giveaway']}: {r['total_entries']}" for r in rows) or "None yet."))
+    async with db.pool.acquire() as connection:
+        giveaway = await connection.fetchrow(
+            "SELECT * FROM giveaways WHERE id = $1",
+            giveaway_id,
+        )
+
+        participant = await connection.fetchrow(
+            """
+            SELECT * FROM participants
+            WHERE giveaway = $1
+            AND user_id = $2
+            """,
+            giveaway_id,
+            callback.from_user.id,
+        )
+
+    if not giveaway or not participant:
+        return await callback.answer(
+            "You are not participating.",
+            show_alert=True,
+        )
+
+    profile = await callback.bot.get_chat(callback.from_user.id)
+
+    full_name = " ".join(
+        filter(
+            None,
+            [
+                profile.first_name,
+                profile.last_name,
+            ],
+        )
+    )
+
+    bio = profile.bio or ""
+
+    bonus = 0
+
+    if (
+        giveaway["bio_bonus"]
+        and giveaway["bio_bonus"].casefold()
+        in bio.casefold()
+    ):
+        bonus += 1
+
+    if (
+        giveaway["name_bonus"]
+        and giveaway["name_bonus"].casefold()
+        in full_name.casefold()
+    ):
+        bonus += 1
+
+    async with db.pool.acquire() as connection:
+        await connection.execute(
+            """
+            UPDATE participants
+            SET bonus = $3,
+            total_entries = 1 + $3 + referral_entries
+            WHERE giveaway = $1
+            AND user_id = $2
+            """,
+            giveaway_id,
+            callback.from_user.id,
+            bonus,
+        )
+
+    await callback.message.edit_text(
+        f"✅ <b>Bonus entries updated!</b>\n\n"
+        f"🎯 Total entries: <b>{1 + bonus + participant['referral_entries']}</b>"
+    )
+
+
+@router.callback_query(F.data == "my_entries")
+async def my_entries(callback: CallbackQuery):
+    async with db.pool.acquire() as connection:
+        participants = await connection.fetch(
+            """
+            SELECT giveaway, total_entries
+            FROM participants
+            WHERE user_id = $1
+            """,
+            callback.from_user.id,
+        )
+
+    if not participants:
+        return await callback.message.edit_text(
+            "You have not joined any giveaway yet."
+        )
+
+    text = "📊 <b>My Entries</b>\n\n"
+
+    text += "\n".join(
+        f"🆔 <code>{participant['giveaway']}</code> — "
+        f"{participant['total_entries']} entries"
+        for participant in participants
+    )
+
+    await callback.message.edit_text(text)
