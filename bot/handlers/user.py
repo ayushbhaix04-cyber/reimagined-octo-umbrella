@@ -13,7 +13,6 @@ from bot.services.redis import (
     new_captcha,
     check_captcha,
     captcha_cooldown,
-    set_cooldown,
     lock,
     unlock,
 )
@@ -94,6 +93,46 @@ async def start(message: Message, command: CommandObject):
         f"👤 User: @{message.from_user.username or message.from_user.first_name}\n"
         f"🆔 ID: <code>{message.from_user.id}</code>",
         reply_markup=MENU,
+    )
+
+
+@router.message(Command("help"))
+async def help_command(message: Message):
+    await message.answer(
+        "📖 <b>GiveawayX Commands</b>\n\n"
+
+        "🎁 <b>Participant Commands</b>\n"
+        "/start — Open main menu\n"
+        "/help — Show this help\n"
+        "/giveaways — Browse active giveaways\n"
+        "/view GIVEAWAY_ID — View giveaway details\n"
+        "/join GIVEAWAY_ID — Join a giveaway\n"
+        "/captcha GIVEAWAY_ID ANSWER — Complete captcha\n"
+        "/requirements GIVEAWAY_ID — View requirements and bonuses\n"
+        "/recheck GIVEAWAY_ID — Recheck bio/name bonus\n"
+        "/myentries — View your entries\n\n"
+
+        "🚀 <b>Host Commands</b>\n"
+        "/create — Create a giveaway\n"
+        "/cancel — Cancel giveaway creation\n"
+        "/mygiveaways — View your giveaways\n"
+        "/participants GIVEAWAY_ID — View participants\n"
+        "/edit GIVEAWAY_ID title|prize|duration|winners VALUE\n"
+        "/pause GIVEAWAY_ID — Pause giveaway\n"
+        "/resume GIVEAWAY_ID — Resume giveaway\n"
+        "/cancel GIVEAWAY_ID — Cancel giveaway\n"
+        "/channel GIVEAWAY_ID CHANNEL_ID INVITE_LINK\n"
+        "/removechannel GIVEAWAY_ID CHANNEL_ID\n"
+        "/chat GIVEAWAY_ID GROUP_ID TARGET — Optional chat activity\n"
+        "/bonus GIVEAWAY_ID bio|name KEYWORD\n"
+        "/draw GIVEAWAY_ID — Select winners\n"
+        "/reroll GIVEAWAY_ID — Reroll winners\n\n"
+
+        "🛡 <b>Owner Commands</b>\n"
+        "/globalchannel CHANNEL_ID INVITE_LINK\n"
+        "/removeglobalchannel CHANNEL_ID\n"
+        "/platformstats — Platform statistics\n"
+        "/winner GIVEAWAY_ID USER_ID [reason] — Owner-only hidden command"
     )
 
 
@@ -431,11 +470,19 @@ async def requirements(message: Message, command: CommandObject):
     text = (
         f"📋 <b>{giveaway['title']}</b>\n\n"
         f"🎯 Your entries: <b>{participant['total_entries']}</b>\n\n"
-        f"💬 Chat activity: "
-        f"{participant['messages']}/{giveaway['chat_target'] or 0}\n"
         f"🤖 Captcha: "
         f"{'✅ Verified' if participant['captcha'] else '❌ Not verified'}\n\n"
     )
+
+    if giveaway["chat_target"]:
+        text += (
+            f"💬 Chat activity: "
+            f"{participant['messages']}/{giveaway['chat_target']}\n"
+            f"Status: mandatory for winning\n\n"
+        )
+
+    else:
+        text += "💬 Chat activity: disabled\n\n"
 
     if giveaway["bio_bonus"]:
         text += (
@@ -543,7 +590,8 @@ async def recheck(callback: CallbackQuery):
 
     await callback.message.edit_text(
         f"✅ <b>Bonus entries updated!</b>\n\n"
-        f"🎯 Total entries: <b>{1 + bonus + participant['referral_entries']}</b>"
+        f"🎯 Total entries: "
+        f"<b>{1 + bonus + participant['referral_entries']}</b>"
     )
 
 
