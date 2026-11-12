@@ -1,14 +1,40 @@
-import asyncio,logging
-from bot.db import pool
+import asyncio
+import logging
+
+from bot import db
 from bot.services.draw import draw
-from bot.services.logs import audit
+
+
 async def run(bot):
     while True:
         try:
-            async with pool.acquire() as c:
-                rows=await c.fetch("SELECT id FROM giveaways WHERE status='active' AND ends<=now()")
-            for r in rows:
-                try: await draw(bot,r["id"])
-                except Exception: logging.exception("draw failed")
-        except Exception: logging.exception("scheduler error")
+            if db.pool is None:
+                logging.warning("Database pool is not ready. Retrying...")
+                await asyncio.sleep(5)
+                continue
+
+            async with db.pool.acquire() as connection:
+                rows = await connection.fetch(
+                    """
+                    SELECT id
+                    FROM giveaways
+                    WHERE status = 'active'
+                    AND ends <= now()
+                    """
+                )
+
+            for row in rows:
+                giveaway_id = row["id"]
+
+                try:
+                    await draw(bot, giveaway_id)
+                except Exception:
+                    logging.exception(
+                        "Draw failed for giveaway %s",
+                        giveaway_id,
+                    )
+
+        except Exception:
+            logging.exception("Scheduler error")
+
         await asyncio.sleep(30)
