@@ -46,11 +46,24 @@ def parse_duration(value: str):
     return None
 
 
+def clean_value(value, max_length=200):
+    if not value:
+        return ""
+
+    value = str(value).strip()
+
+    if value.lower() in {"skip", "-", "none", "no"}:
+        return ""
+
+    return value[:max_length]
+
+
 @router.callback_query(F.data == "host_create")
 async def host_create(
     callback: CallbackQuery,
     state: FSMContext,
 ):
+    await state.clear()
     await state.set_state(CreateGiveaway.title)
 
     await callback.message.edit_text(
@@ -61,9 +74,24 @@ async def host_create(
     )
 
 
+@router.message(Command("cancel"))
+async def cancel_creation(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "❌ Giveaway creation cancelled.\n\nUse /create to start again."
+    )
+
+
 @router.message(CreateGiveaway.title)
 async def set_title(message: Message, state: FSMContext):
-    await state.update_data(title=message.text[:100])
+    title = clean_value(message.text, 100)
+
+    if not title:
+        return await message.answer(
+            "❌ Please send a valid giveaway title."
+        )
+
+    await state.update_data(title=title)
     await state.set_state(CreateGiveaway.prize)
 
     await message.answer("2️⃣ Send the prize:")
@@ -71,12 +99,23 @@ async def set_title(message: Message, state: FSMContext):
 
 @router.message(CreateGiveaway.prize)
 async def set_prize(message: Message, state: FSMContext):
-    await state.update_data(prize=message.text[:300])
+    prize = clean_value(message.text, 300)
+
+    if not prize:
+        return await message.answer(
+            "❌ Please send a valid prize."
+        )
+
+    await state.update_data(prize=prize)
     await state.set_state(CreateGiveaway.duration)
 
     await message.answer(
         "3️⃣ Send duration:\n\n"
-        "Examples: <code>1m</code>, <code>1h</code>, <code>7d</code>, <code>90d</code>"
+        "Examples:\n"
+        "<code>1m</code>\n"
+        "<code>1h</code>\n"
+        "<code>7d</code>\n"
+        "<code>90d</code>"
     )
 
 
@@ -113,37 +152,66 @@ async def set_winners(message: Message, state: FSMContext):
 
 @router.message(CreateGiveaway.channel)
 async def set_channel(message: Message, state: FSMContext):
-    await state.update_data(channel=message.text.strip())
+    channel = clean_value(message.text, 200)
+
+    await state.update_data(channel=channel)
     await state.set_state(CreateGiveaway.chat)
 
     await message.answer(
-        "6️⃣ Send chat activity requirement.\n\n"
+        "6️⃣ Send optional chat activity requirement.\n\n"
+        "Format:\n<code>GROUP_ID:MESSAGE_TARGET</code>\n\n"
         "Example:\n<code>-1001234567890:20</code>\n\n"
-        "This means: send 20 messages in that group.\n\n"
+        "This means: participants must send 20 messages in that group.\n\n"
         "Send <code>skip</code> to disable."
     )
 
 
 @router.message(CreateGiveaway.chat)
 async def set_chat(message: Message, state: FSMContext):
-    await state.update_data(chat=message.text.strip())
+    chat = clean_value(message.text, 100)
+
+    if chat and ":" not in chat:
+        return await message.answer(
+            "❌ Use format:\n<code>GROUP_ID:TARGET</code>\n\n"
+            "Example:\n<code>-1001234567890:20</code>"
+        )
+
+    if chat:
+        try:
+            group_id, target = chat.split(":")
+            group_id = int(group_id)
+            target = int(target)
+
+            if not 0 <= target <= 10000:
+                raise ValueError
+        except Exception:
+            return await message.answer(
+                "❌ Invalid chat format.\n\n"
+                "Use:\n<code>GROUP_ID:TARGET</code>"
+            )
+
+    await state.update_data(chat=chat)
     await state.set_state(CreateGiveaway.bio)
 
     await message.answer(
-        "7️⃣ Send bio bonus keyword.\n\n"
+        "7️⃣ Send optional bio bonus keyword.\n\n"
         "Example:\n<code>@uniquegiveaways123</code>\n\n"
+        "This gives +1 bonus entry.\n\n"
         "Send <code>skip</code> to disable."
     )
 
 
 @router.message(CreateGiveaway.bio)
 async def set_bio(message: Message, state: FSMContext):
-    await state.update_data(bio=message.text.strip())
+    bio = clean_value(message.text, 100)
+
+    await state.update_data(bio=bio)
     await state.set_state(CreateGiveaway.name)
 
     await message.answer(
-        "8️⃣ Send name bonus keyword.\n\n"
+        "8️⃣ Send optional name bonus keyword.\n\n"
         "Example:\n<code>@uniquegiveaways123</code>\n\n"
+        "This gives +1 bonus entry.\n\n"
         "Send <code>skip</code> to disable."
     )
 
@@ -156,16 +224,34 @@ async def finish_creation(
 ):
     data = await state.get_data()
 
+    title = clean_value(data.get("title"), 100)
+    prize = clean_value(data.get("prize"), 300)
+    duration = data.get("duration")
+    winners = data.get("winners")
+    channel = clean_value(data.get("channel"), 200)
+    chat = clean_value(data.get("chat"), 100)
+    bio_bonus = clean_value(data.get("bio"), 100)
+    name_bonus = clean_value(data.get("name"), 100)
+
+    if not title or not prize or not duration or not winners:
+        await state.clear()
+
+        return await message.answer(
+            "❌ Giveaway creation data expired or incomplete.\n\n"
+            "Please use /create again."
+        )
+
     chat_id = None
     chat_target = 0
 
-    if data["chat"] != "skip" and ":" in data["chat"]:
-        chat_id, chat_target = data["chat"].split(":")
-        chat_id = int(chat_id)
-        chat_target = int(chat_target)
-
-    bio_bonus = "" if data["bio"] == "skip" else data["bio"]
-    name_bonus = "" if data["name"] == "skip" else data["name"]
+    if chat and ":" in chat:
+        try:
+            chat_id, chat_target = chat.split(":")
+            chat_id = int(chat_id)
+            chat_target = int(chat_target)
+        except Exception:
+            chat_id = None
+            chat_target = 0
 
     async with db.pool.acquire() as connection:
         giveaway_id = await connection.fetchval(
@@ -186,28 +272,30 @@ async def finish_creation(
             RETURNING id
             """,
             message.from_user.id,
-            data["title"],
-            data["prize"],
+            title,
+            prize,
             datetime.now(timezone.utc)
-            + timedelta(seconds=data["duration"]),
-            data["winners"],
+            + timedelta(seconds=duration),
+            winners,
             chat_id,
             chat_target,
             bio_bonus,
             name_bonus,
         )
 
-        if data["channel"] != "skip":
+        if channel:
             await connection.execute(
                 """
                 INSERT INTO giveaway_channels
                 (giveaway, chat_id, title, link)
                 VALUES ($1, $2, $3, $4)
+                ON CONFLICT (giveaway, chat_id)
+                DO UPDATE SET link = $4
                 """,
                 giveaway_id,
-                data["channel"],
-                data["channel"],
-                data["channel"],
+                channel,
+                channel,
+                channel,
             )
 
         await connection.execute(
@@ -228,13 +316,18 @@ async def finish_creation(
         f"?start=giveaway_{giveaway_id}"
     )
 
+    discovery_text = (
+        "🎉 <b>NEW GIVEAWAY</b>\n\n"
+        f"🎁 {prize}\n"
+        f"👥 Winners: {winners}\n"
+        f"👤 Host: @{message.from_user.username or message.from_user.id}\n"
+        f"🆔 Giveaway ID: <code>{giveaway_id}</code>\n\n"
+        "Tap below to participate."
+    )
+
     discovery_message = await discover(
         bot,
-        f"🎉 <b>NEW GIVEAWAY</b>\n\n"
-        f"🎁 {data['prize']}\n"
-        f"👥 Winners: {data['winners']}\n"
-        f"👤 Host: @{message.from_user.username or message.from_user.id}\n"
-        f"🆔 Giveaway ID: <code>{giveaway_id}</code>",
+        discovery_text,
         InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -264,14 +357,17 @@ async def finish_creation(
         "GIVEAWAY_CREATED",
         message.from_user.id,
         giveaway_id,
-        f"{data['title']} | {data['prize']}",
+        f"{title} | {prize}",
     )
 
     await message.answer(
-        f"✅ <b>Giveaway created!</b>\n\n"
+        "✅ <b>Giveaway created!</b>\n\n"
         f"🆔 ID: <code>{giveaway_id}</code>\n"
-        f"🎁 Prize: {data['prize']}\n"
-        f"⏳ Duration: {data['duration'] // 60} minutes+\n\n"
+        f"🎁 Prize: {prize}\n"
+        f"👥 Winners: {winners}\n"
+        f"💬 Chat target: {chat_target or 'Disabled'}\n"
+        f"📝 Bio bonus: {bio_bonus or 'Disabled'}\n"
+        f"🏷 Name bonus: {name_bonus or 'Disabled'}\n\n"
         f"Participation link:\n{participation_link}"
     )
 
@@ -281,7 +377,8 @@ async def my_giveaways(message: Message):
     async with db.pool.acquire() as connection:
         giveaways = await connection.fetch(
             """
-            SELECT * FROM giveaways
+            SELECT *
+            FROM giveaways
             WHERE host = $1
             ORDER BY id DESC
             LIMIT 20
@@ -583,7 +680,8 @@ async def set_chat_requirement(message: Message, command: CommandObject):
     if len(args) < 3:
         return await message.answer(
             "Usage: /chat GIVEAWAY_ID GROUP_ID TARGET\n\n"
-            "Example:\n/chat 1 -1001234567890 20"
+            "Example:\n/chat 1 -1001234567890 20\n\n"
+            "Use target 0 to disable chat activity."
         )
 
     giveaway_id = int(args[0])
@@ -726,3 +824,33 @@ async def set_bonus(message: Message, command: CommandObject):
     )
 
     await message.answer("✅ Bonus updated.")
+
+
+@router.message(Command("draw", "reroll"))
+async def draw_command(message: Message, command: CommandObject, bot: Bot):
+    from bot.services.draw import draw
+
+    giveaway_id = int(command.args or 0)
+
+    try:
+        winners = await draw(
+            bot,
+            giveaway_id,
+            message.from_user.id,
+            command.command == "reroll",
+        )
+    except ValueError as error:
+        return await message.answer(f"❌ {error}")
+
+    if not winners:
+        return await message.answer(
+            "No eligible participants."
+        )
+
+    await message.answer(
+        "🏆 <b>Winners selected!</b>\n\n"
+        + "\n".join(
+            f"{index}. <code>{user_id}</code>"
+            for index, user_id in enumerate(winners, 1)
+        )
+        )
