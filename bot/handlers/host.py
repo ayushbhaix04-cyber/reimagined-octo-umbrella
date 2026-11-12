@@ -1,122 +1,728 @@
-from aiogram import Router,F,Bot
-from aiogram.filters import Command,CommandObject
-from aiogram.types import Message,CallbackQuery,InlineKeyboardMarkup,InlineKeyboardButton
+from datetime import datetime, timedelta, timezone
+
+from aiogram import Router, F, Bot
+from aiogram.filters import Command, CommandObject
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State,StatesGroup
-from datetime import datetime,timedelta,timezone
-from bot.db import pool
-from bot.services.logs import audit,discover
-router=Router()
+from aiogram.fsm.state import State, StatesGroup
 
-class CW(StatesGroup):
-    title=State(); prize=State(); duration=State(); winners=State(); channel=State(); chat=State(); bio=State(); name=State()
+from bot import db
+from bot.services.logs import audit, discover
 
-@router.callback_query(F.data=="host_create")
-async def host_create(cb:CallbackQuery,state:FSMContext):
-    await state.set_state(CW.title)
-    await cb.message.edit_text("🚀 <b>Create Giveaway</b>\n✅ No approval needed.\n\n1️⃣ Send title:")
+router = Router()
 
-@router.message(CW.title)
-async def s_title(m:Message,state:FSMContext):
-    await state.update_data(title=m.text[:100]); await state.set_state(CW.prize)
-    await m.answer("2️⃣ Send prize:")
-@router.message(CW.prize)
-async def s_prize(m:Message,state:FSMContext):
-    await state.update_data(prize=m.text[:300]); await state.set_state(CW.duration)
-    await m.answer("3️⃣ Duration (1m–90d):")
-@router.message(CW.duration)
-async def s_dur(m:Message,state:FSMContext):
-    def parse(v):
-        try: s=int(v[:-1])*{'m':60,'h':3600,'d':86400}[v[-1]]
-        except Exception: return None
-        return s if 60<=s<=7776000 else None
-    sec=parse(m.text.strip())
-    if not sec: return await m.answer("❌ Use 1m–90d.")
-    await state.update_data(dur=sec); await state.set_state(CW.winners)
-    await m.answer("4️⃣ Winners (1–100):")
-@router.message(CW.winners)
-async def s_win(m:Message,state:FSMContext):
-    if not m.text.isdigit() or not 1<=int(m.text)<=100: return await m.answer("❌ 1–100.")
-    await state.update_data(winners=int(m.text)); await state.set_state(CW.channel)
-    await m.answer("5️⃣ Required channel (username or invite link). Send 'skip' to skip:")
-@router.message(CW.channel)
-async def s_chan(m:Message,state:FSMContext):
-    await state.update_data(channel=m.text.strip()); await state.set_state(CW.chat)
-    await m.answer("6️⃣ Chat activity: GROUP_ID:TARGET (e.g. -100123:20). 'skip' to disable:")
-@router.message(CW.chat)
-async def s_chat(m:Message,state:FSMContext):
-    await state.update_data(chat=m.text.strip()); await state.set_state(CW.bio)
-    await m.answer("7️⃣ Bio bonus keyword (+1). 'skip' to disable:")
-@router.message(CW.bio)
-async def s_bio(m:Message,state:FSMContext):
-    await state.update_data(bio=m.text.strip()); await state.set_state(CW.name)
-    await m.answer("8️⃣ Name bonus keyword (+1). 'skip' to disable:")
-@router.message(CW.name)
-async def finish(m:Message,state:FSMContext,bot:Bot):
-    d=await state.get_data()
-    async with pool.acquire() as c:
-        gid=await c.fetchval("""INSERT INTO giveaways(host,title,prize,ends,winners,chat_id,chat_target,bio_bonus,name_bonus)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id""",
-          m.from_user.id,d['title'],d['prize'],datetime.now(timezone.utc)+timedelta(seconds=d['dur']),d['winners'],
-          *( (int(d['chat'].split(':')[0]),int(d['chat'].split(':')[1])) if ':' in d['chat'] and d['chat']!='skip' else (None,0) ),
-          '' if d['bio']=='skip' else d['bio'], '' if d['name']=='skip' else d['name'])
-        if d['channel']!='skip':
-            await c.execute("INSERT INTO giveaway_channels(giveaway,chat_id,link) VALUES($1,$2,$3)",gid,d['channel'],d['channel'])
-        await c.execute("UPDATE users SET is_host=TRUE WHERE tg_id=$1",m.from_user.id)
+
+class CreateGiveaway(StatesGroup):
+    title = State()
+    prize = State()
+    duration = State()
+    winners = State()
+    channel = State()
+    chat = State()
+    bio = State()
+    name = State()
+
+
+def parse_duration(value: str):
+    units = {
+        "m": 60,
+        "h": 3600,
+        "d": 86400,
+    }
+
+    try:
+        seconds = int(value[:-1]) * units[value[-1].lower()]
+    except Exception:
+        return None
+
+    if 60 <= seconds <= 7776000:
+        return seconds
+
+    return None
+
+
+@router.callback_query(F.data == "host_create")
+async def host_create(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    await state.set_state(CreateGiveaway.title)
+
+    await callback.message.edit_text(
+        "🚀 <b>Create Giveaway</b>\n\n"
+        "✅ No approval required.\n"
+        "You can create and manage your own giveaways.\n\n"
+        "1️⃣ Send the giveaway title:"
+    )
+
+
+@router.message(CreateGiveaway.title)
+async def set_title(message: Message, state: FSMContext):
+    await state.update_data(title=message.text[:100])
+    await state.set_state(CreateGiveaway.prize)
+
+    await message.answer("2️⃣ Send the prize:")
+
+
+@router.message(CreateGiveaway.prize)
+async def set_prize(message: Message, state: FSMContext):
+    await state.update_data(prize=message.text[:300])
+    await state.set_state(CreateGiveaway.duration)
+
+    await message.answer(
+        "3️⃣ Send duration:\n\n"
+        "Examples: <code>1m</code>, <code>1h</code>, <code>7d</code>, <code>90d</code>"
+    )
+
+
+@router.message(CreateGiveaway.duration)
+async def set_duration(message: Message, state: FSMContext):
+    seconds = parse_duration(message.text.strip())
+
+    if not seconds:
+        return await message.answer(
+            "❌ Duration must be between 1m and 90d."
+        )
+
+    await state.update_data(duration=seconds)
+    await state.set_state(CreateGiveaway.winners)
+
+    await message.answer("4️⃣ How many winners?")
+
+
+@router.message(CreateGiveaway.winners)
+async def set_winners(message: Message, state: FSMContext):
+    if not message.text.isdigit() or not 1 <= int(message.text) <= 100:
+        return await message.answer(
+            "❌ Send a number between 1 and 100."
+        )
+
+    await state.update_data(winners=int(message.text))
+    await state.set_state(CreateGiveaway.channel)
+
+    await message.answer(
+        "5️⃣ Send a required channel username or invite link.\n\n"
+        "Send <code>skip</code> to continue without a channel."
+    )
+
+
+@router.message(CreateGiveaway.channel)
+async def set_channel(message: Message, state: FSMContext):
+    await state.update_data(channel=message.text.strip())
+    await state.set_state(CreateGiveaway.chat)
+
+    await message.answer(
+        "6️⃣ Send chat activity requirement.\n\n"
+        "Example:\n<code>-1001234567890:20</code>\n\n"
+        "This means: send 20 messages in that group.\n\n"
+        "Send <code>skip</code> to disable."
+    )
+
+
+@router.message(CreateGiveaway.chat)
+async def set_chat(message: Message, state: FSMContext):
+    await state.update_data(chat=message.text.strip())
+    await state.set_state(CreateGiveaway.bio)
+
+    await message.answer(
+        "7️⃣ Send bio bonus keyword.\n\n"
+        "Example:\n<code>@uniquegiveaways123</code>\n\n"
+        "Send <code>skip</code> to disable."
+    )
+
+
+@router.message(CreateGiveaway.bio)
+async def set_bio(message: Message, state: FSMContext):
+    await state.update_data(bio=message.text.strip())
+    await state.set_state(CreateGiveaway.name)
+
+    await message.answer(
+        "8️⃣ Send name bonus keyword.\n\n"
+        "Example:\n<code>@uniquegiveaways123</code>\n\n"
+        "Send <code>skip</code> to disable."
+    )
+
+
+@router.message(CreateGiveaway.name)
+async def finish_creation(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+):
+    data = await state.get_data()
+
+    chat_id = None
+    chat_target = 0
+
+    if data["chat"] != "skip" and ":" in data["chat"]:
+        chat_id, chat_target = data["chat"].split(":")
+        chat_id = int(chat_id)
+        chat_target = int(chat_target)
+
+    bio_bonus = "" if data["bio"] == "skip" else data["bio"]
+    name_bonus = "" if data["name"] == "skip" else data["name"]
+
+    async with db.pool.acquire() as connection:
+        giveaway_id = await connection.fetchval(
+            """
+            INSERT INTO giveaways
+            (
+                host,
+                title,
+                prize,
+                ends,
+                winners,
+                chat_id,
+                chat_target,
+                bio_bonus,
+                name_bonus
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING id
+            """,
+            message.from_user.id,
+            data["title"],
+            data["prize"],
+            datetime.now(timezone.utc)
+            + timedelta(seconds=data["duration"]),
+            data["winners"],
+            chat_id,
+            chat_target,
+            bio_bonus,
+            name_bonus,
+        )
+
+        if data["channel"] != "skip":
+            await connection.execute(
+                """
+                INSERT INTO giveaway_channels
+                (giveaway, chat_id, title, link)
+                VALUES ($1, $2, $3, $4)
+                """,
+                giveaway_id,
+                data["channel"],
+                data["channel"],
+                data["channel"],
+            )
+
+        await connection.execute(
+            """
+            UPDATE users
+            SET is_host = TRUE
+            WHERE tg_id = $1
+            """,
+            message.from_user.id,
+        )
+
     await state.clear()
-    url=f"https://t.me/{(await bot.me()).username}?start=giveaway_{gid}"
-    post=await discover(bot,f"🎉 <b>NEW GIVEAWAY</b>\n🎁 {d['prize']}\n👥 {d['winners']} winners\n🆔 #{gid}",InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎁 Participate",url=url)]]))
-    if post:
-        async with pool.acquire() as c: await c.execute("UPDATE giveaways SET discovery_msg=$2 WHERE id=$1",gid,post.message_id)
-    await audit(bot,"CREATED",m.from_user.id,gid,f"{d['title']} | {d['prize']}")
-    await m.answer(f"✅ Created #{gid}. Add channels/chat/bonuses via /help commands.\n{url}")
+
+    bot_username = (await bot.me()).username
+
+    participation_link = (
+        f"https://t.me/{bot_username}"
+        f"?start=giveaway_{giveaway_id}"
+    )
+
+    discovery_message = await discover(
+        bot,
+        f"🎉 <b>NEW GIVEAWAY</b>\n\n"
+        f"🎁 {data['prize']}\n"
+        f"👥 Winners: {data['winners']}\n"
+        f"👤 Host: @{message.from_user.username or message.from_user.id}\n"
+        f"🆔 Giveaway ID: <code>{giveaway_id}</code>",
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🎁 Participate Now",
+                        url=participation_link,
+                    )
+                ]
+            ]
+        ),
+    )
+
+    if discovery_message:
+        async with db.pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE giveaways
+                SET discovery_msg = $2
+                WHERE id = $1
+                """,
+                giveaway_id,
+                discovery_message.message_id,
+            )
+
+    await audit(
+        bot,
+        "GIVEAWAY_CREATED",
+        message.from_user.id,
+        giveaway_id,
+        f"{data['title']} | {data['prize']}",
+    )
+
+    await message.answer(
+        f"✅ <b>Giveaway created!</b>\n\n"
+        f"🆔 ID: <code>{giveaway_id}</code>\n"
+        f"🎁 Prize: {data['prize']}\n"
+        f"⏳ Duration: {data['duration'] // 60} minutes+\n\n"
+        f"Participation link:\n{participation_link}"
+    )
+
 
 @router.message(Command("mygiveaways"))
-async def my(m:Message):
-    async with pool.acquire() as c: rows=await c.fetch("SELECT * FROM giveaways WHERE host=$1 ORDER BY id DESC LIMIT 20",m.from_user.id)
-    await m.answer("📋 <b>My Giveaways</b>\n"+("\n".join(f"#{r['id']} {r['title']} [{r['status']}]" for r in rows) or "None. Use /create"))
+async def my_giveaways(message: Message):
+    async with db.pool.acquire() as connection:
+        giveaways = await connection.fetch(
+            """
+            SELECT * FROM giveaways
+            WHERE host = $1
+            ORDER BY id DESC
+            LIMIT 20
+            """,
+            message.from_user.id,
+        )
+
+    if not giveaways:
+        return await message.answer(
+            "You have not created any giveaways yet.\n\nUse /create"
+        )
+
+    text = "📋 <b>My Giveaways</b>\n\n"
+
+    text += "\n".join(
+        f"🆔 <code>{giveaway['id']}</code> — "
+        f"{giveaway['title']} [{giveaway['status']}]"
+        for giveaway in giveaways
+    )
+
+    await message.answer(text)
+
 
 @router.message(Command("participants"))
-async def parts(m:Message,command:CommandObject):
-    gid=int(command.args or 0)
-    async with pool.acquire() as c:
-        g=await c.fetchrow("SELECT host FROM giveaways WHERE id=$1",gid)
-        if not g or (g['host']!=m.from_user.id and m.from_user.id!=0): return await m.answer("❌ Not your giveaway.")
-        rows=await c.fetch("SELECT user_id,messages,bonus,referral_entries,total_entries FROM participants WHERE giveaway=$1 LIMIT 100",gid)
-    await m.answer("👥 Participants\n"+("\n".join(f"{r['user_id']}: {r['total_entries']} entries (chat {r['messages']}, bonus {r['bonus']}, ref {r['referral_entries']})" for r in rows) or "None"))
+async def participants(message: Message, command: CommandObject):
+    giveaway_id = int(command.args or 0)
+
+    async with db.pool.acquire() as connection:
+        giveaway = await connection.fetchrow(
+            "SELECT host FROM giveaways WHERE id = $1",
+            giveaway_id,
+        )
+
+        if not giveaway or giveaway["host"] != message.from_user.id:
+            return await message.answer(
+                "❌ You can view only your own giveaways."
+            )
+
+        participants = await connection.fetch(
+            """
+            SELECT user_id, messages, bonus, referral_entries, total_entries
+            FROM participants
+            WHERE giveaway = $1
+            LIMIT 100
+            """,
+            giveaway_id,
+        )
+
+    if not participants:
+        return await message.answer("No participants yet.")
+
+    text = f"👥 <b>Participants — {giveaway_id}</b>\n\n"
+
+    text += "\n".join(
+        f"• <code>{participant['user_id']}</code> — "
+        f"{participant['total_entries']} entries\n"
+        f"💬 Chat: {participant['messages']}\n"
+        f"🎁 Bonus: {participant['bonus']}\n"
+        f"👥 Referrals: {participant['referral_entries']}"
+        for participant in participants
+    )
+
+    await message.answer(text)
+
 
 @router.message(Command("edit"))
-async def edit(m:Message,command:CommandObject):
-    args=(command.args or '').split(maxsplit=2)
-    if len(args)<3: return await m.answer("Usage: /edit ID field value\nFields: title,prize,duration,winners")
-    gid,field,value=int(args[0]),args[1],args[2]
-    async with pool.acquire() as c:
-        g=await c.fetchrow("SELECT host FROM giveaways WHERE id=$1",gid)
-        if not g or g['host']!=m.from_user.id: return await m.answer("❌ Not your giveaway.")
-        if field in("title","prize"): await c.execute(f"UPDATE giveaways SET {field}=$2 WHERE id=$1",gid,value[:500])
-        elif field=="duration":
-            sec=int(value[:-1])*{'m':60,'h':3600,'d':86400}[value[-1]]
-            await c.execute("UPDATE giveaways SET ends=$2 WHERE id=$1",gid,datetime.now(timezone.utc)+timedelta(seconds=sec))
-        elif field=="winners" and value.isdigit(): await c.execute("UPDATE giveaways SET winners=$2 WHERE id=$1",gid,int(value))
-        else: return await m.answer("❌ Invalid field.")
-    await audit(m.bot,"EDITED",m.from_user.id,gid,f"{field}={value}")
-    await m.answer("✅ Updated.")
+async def edit_giveaway(message: Message, command: CommandObject):
+    args = (command.args or "").split(maxsplit=2)
 
-@router.message(Command("pause","resume","cancel"))
-async def status_cmd(m:Message,command:CommandObject):
-    gid=int(command.args or 0)
-    async with pool.acquire() as c:
-        g=await c.fetchrow("SELECT host FROM giveaways WHERE id=$1",gid)
-        if not g or g['host']!=m.from_user.id: return await m.answer("❌ Not your giveaway.")
-        await c.execute("UPDATE giveaways SET status=$2 WHERE id=$1",gid,{'pause':'paused','resume':'active','cancel':'cancelled'}[command.command])
-    await audit(m.bot,command.command,m.from_user.id,gid)
-    await m.answer("✅ Updated.")
+    if len(args) < 3:
+        return await message.answer(
+            "Usage:\n"
+            "/edit ID title VALUE\n"
+            "/edit ID prize VALUE\n"
+            "/edit ID duration 7d\n"
+            "/edit ID winners 3"
+        )
 
-@router.message(Command("draw","reroll"))
-async def draw_cmd(m:Message,command:CommandObject,bot:Bot):
-    from bot.services.draw import draw
-    gid=int(command.args or 0)
-    try:
-        winners=await draw(bot,gid,m.from_user.id,command.command=="reroll")
-    except ValueError as e: return await m.answer(f"❌ {e}")
-    await m.answer("🏆 Winners: "+(", ".join(map(str,winners)) or "none"))
+    giveaway_id = int(args[0])
+    field = args[1]
+    value = args[2]
+
+    async with db.pool.acquire() as connection:
+        giveaway = await connection.fetchrow(
+            "SELECT host FROM giveaways WHERE id = $1",
+            giveaway_id,
+        )
+
+        if not giveaway or giveaway["host"] != message.from_user.id:
+            return await message.answer(
+                "❌ You can edit only your own giveaways."
+            )
+
+        if field in {"title", "prize"}:
+            await connection.execute(
+                f"UPDATE giveaways SET {field} = $2 WHERE id = $1",
+                giveaway_id,
+                value[:500],
+            )
+
+        elif field == "duration":
+            seconds = parse_duration(value)
+
+            if not seconds:
+                return await message.answer(
+                    "❌ Invalid duration."
+                )
+
+            await connection.execute(
+                """
+                UPDATE giveaways
+                SET ends = $2
+                WHERE id = $1
+                """,
+                giveaway_id,
+                datetime.now(timezone.utc)
+                + timedelta(seconds=seconds),
+            )
+
+        elif field == "winners":
+            if not value.isdigit() or not 1 <= int(value) <= 100:
+                return await message.answer(
+                    "❌ Winners must be 1–100."
+                )
+
+            await connection.execute(
+                "UPDATE giveaways SET winners = $2 WHERE id = $1",
+                giveaway_id,
+                int(value),
+            )
+
+        else:
+            return await message.answer(
+                "❌ Invalid field."
+            )
+
+    await audit(
+        message.bot,
+        "GIVEAWAY_EDITED",
+        message.from_user.id,
+        giveaway_id,
+        f"{field}={value}",
+    )
+
+    await message.answer("✅ Giveaway updated.")
+
+
+@router.message(Command("pause", "resume", "cancel"))
+async def change_status(message: Message, command: CommandObject):
+    giveaway_id = int(command.args or 0)
+
+    status = {
+        "pause": "paused",
+        "resume": "active",
+        "cancel": "cancelled",
+    }[command.command]
+
+    async with db.pool.acquire() as connection:
+        giveaway = await connection.fetchrow(
+            "SELECT host FROM giveaways WHERE id = $1",
+            giveaway_id,
+        )
+
+        if not giveaway or giveaway["host"] != message.from_user.id:
+            return await message.answer(
+                "❌ You can manage only your own giveaways."
+            )
+
+        await connection.execute(
+            "UPDATE giveaways SET status = $2 WHERE id = $1",
+            giveaway_id,
+            status,
+        )
+
+    await audit(
+        message.bot,
+        command.command.upper(),
+        message.from_user.id,
+        giveaway_id,
+    )
+
+    await message.answer("✅ Updated.")
+
+
+@router.message(Command("channel"))
+async def add_channel(message: Message, command: CommandObject):
+    args = (command.args or "").split(maxsplit=2)
+
+    if len(args) < 3:
+        return await message.answer(
+            "Usage: /channel GIVEAWAY_ID CHANNEL_ID INVITE_LINK"
+        )
+
+    giveaway_id = int(args[0])
+    channel_id = int(args[1])
+    invite_link = args[2]
+
+    async with db.pool.acquire() as connection:
+        giveaway = await connection.fetchrow(
+            "SELECT host FROM giveaways WHERE id = $1",
+            giveaway_id,
+        )
+
+        if not giveaway or giveaway["host"] != message.from_user.id:
+            return await message.answer(
+                "❌ You can manage only your own giveaways."
+            )
+
+        bot_id = (await message.bot.me()).id
+
+        try:
+            bot_member = await message.bot.get_chat_member(
+                channel_id,
+                bot_id,
+            )
+        except Exception:
+            return await message.answer(
+                "❌ Add the bot as administrator in that channel first."
+            )
+
+        if bot_member.status not in {"administrator", "creator"}:
+            return await message.answer(
+                "❌ Bot must be administrator in the required channel."
+            )
+
+        await connection.execute(
+            """
+            INSERT INTO giveaway_channels
+            (giveaway, chat_id, title, link)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (giveaway, chat_id)
+            DO UPDATE SET link = $4
+            """,
+            giveaway_id,
+            channel_id,
+            args[1],
+            invite_link,
+        )
+
+    await audit(
+        message.bot,
+        "CHANNEL_ADDED",
+        message.from_user.id,
+        giveaway_id,
+        invite_link,
+    )
+
+    await message.answer("✅ Required channel added.")
+
+
+@router.message(Command("removechannel"))
+async def remove_channel(message: Message, command: CommandObject):
+    args = (command.args or "").split()
+
+    if len(args) < 2:
+        return await message.answer(
+            "Usage: /removechannel GIVEAWAY_ID CHANNEL_ID"
+        )
+
+    giveaway_id = int(args[0])
+    channel_id = int(args[1])
+
+    async with db.pool.acquire() as connection:
+        giveaway = await connection.fetchrow(
+            "SELECT host FROM giveaways WHERE id = $1",
+            giveaway_id,
+        )
+
+        if not giveaway or giveaway["host"] != message.from_user.id:
+            return await message.answer(
+                "❌ You can manage only your own giveaways."
+            )
+
+        await connection.execute(
+            """
+            DELETE FROM giveaway_channels
+            WHERE giveaway = $1
+            AND chat_id = $2
+            """,
+            giveaway_id,
+            channel_id,
+        )
+
+    await audit(
+        message.bot,
+        "CHANNEL_REMOVED",
+        message.from_user.id,
+        giveaway_id,
+        str(channel_id),
+    )
+
+    await message.answer("✅ Channel removed.")
+
+
+@router.message(Command("chat"))
+async def set_chat_requirement(message: Message, command: CommandObject):
+    args = (command.args or "").split()
+
+    if len(args) < 3:
+        return await message.answer(
+            "Usage: /chat GIVEAWAY_ID GROUP_ID TARGET\n\n"
+            "Example:\n/chat 1 -1001234567890 20"
+        )
+
+    giveaway_id = int(args[0])
+    group_id = int(args[1])
+    target = int(args[2])
+
+    if not 0 <= target <= 10000:
+        return await message.answer(
+            "❌ Target must be between 0 and 10000."
+        )
+
+    async with db.pool.acquire() as connection:
+        giveaway = await connection.fetchrow(
+            "SELECT host FROM giveaways WHERE id = $1",
+            giveaway_id,
+        )
+
+        if not giveaway or giveaway["host"] != message.from_user.id:
+            return await message.answer(
+                "❌ You can manage only your own giveaways."
+            )
+
+        if target > 0:
+            try:
+                chat = await message.bot.get_chat(group_id)
+            except Exception:
+                return await message.answer(
+                    "❌ Invalid group ID."
+                )
+
+            if chat.type not in {"group", "supergroup"}:
+                return await message.answer(
+                    "❌ Chat activity must be a group."
+                )
+
+            bot_id = (await message.bot.me()).id
+
+            try:
+                bot_member = await message.bot.get_chat_member(
+                    group_id,
+                    bot_id,
+                )
+            except Exception:
+                return await message.answer(
+                    "❌ Add the bot as administrator in the group first."
+                )
+
+            if bot_member.status not in {"administrator", "creator"}:
+                return await message.answer(
+                    "❌ Bot must be group administrator to count messages."
+                )
+
+        await connection.execute(
+            """
+            UPDATE giveaways
+            SET chat_id = $2,
+            chat_target = $3
+            WHERE id = $1
+            """,
+            giveaway_id,
+            group_id if target else None,
+            target,
+        )
+
+        await connection.execute(
+            """
+            UPDATE participants
+            SET messages = 0,
+            last_count = NULL
+            WHERE giveaway = $1
+            """,
+            giveaway_id,
+        )
+
+    await audit(
+        message.bot,
+        "CHAT_REQUIREMENT_SET",
+        message.from_user.id,
+        giveaway_id,
+        f"target={target}",
+    )
+
+    await message.answer(
+        f"✅ Chat target set to {target}."
+    )
+
+
+@router.message(Command("bonus"))
+async def set_bonus(message: Message, command: CommandObject):
+    args = (command.args or "").split(maxsplit=2)
+
+    if len(args) < 3:
+        return await message.answer(
+            "Usage:\n"
+            "/bonus ID bio KEYWORD\n"
+            "/bonus ID name KEYWORD\n"
+            "/bonus ID bio -\n"
+            "/bonus ID name -"
+        )
+
+    giveaway_id = int(args[0])
+    bonus_type = args[1]
+    keyword = args[2]
+
+    if bonus_type not in {"bio", "name"}:
+        return await message.answer(
+            "❌ Bonus type must be bio or name."
+        )
+
+    keyword = "" if keyword == "-" else keyword[:100]
+
+    async with db.pool.acquire() as connection:
+        giveaway = await connection.fetchrow(
+            "SELECT host FROM giveaways WHERE id = $1",
+            giveaway_id,
+        )
+
+        if not giveaway or giveaway["host"] != message.from_user.id:
+            return await message.answer(
+                "❌ You can manage only your own giveaways."
+            )
+
+        await connection.execute(
+            f"UPDATE giveaways SET {bonus_type}_bonus = $2 WHERE id = $1",
+            giveaway_id,
+            keyword,
+        )
+
+        await connection.execute(
+            "UPDATE participants SET bonus = 0 WHERE giveaway = $1",
+            giveaway_id,
+        )
+
+    await audit(
+        message.bot,
+        "BONUS_SET",
+        message.from_user.id,
+        giveaway_id,
+        f"{bonus_type}={keyword}",
+    )
+
+    await message.answer("✅ Bonus updated.")
