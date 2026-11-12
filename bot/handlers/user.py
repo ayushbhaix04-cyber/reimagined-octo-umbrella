@@ -132,7 +132,6 @@ async def help_command(message: Message):
         "/globalchannel CHANNEL_ID INVITE_LINK\n"
         "/removeglobalchannel CHANNEL_ID\n"
         "/platformstats — Platform statistics\n"
-        "/winner GIVEAWAY_ID USER_ID [reason] — Owner-only hidden command"
     )
 
 
