@@ -58,6 +58,42 @@ def clean_value(value, max_length=200):
     return value[:max_length]
 
 
+async def resolve_channel(bot: Bot, value: str):
+    """
+    Accepts:
+    - @username
+    - -1001234567890
+    - https://t.me/username
+
+    Returns:
+    (chat_id, invite_link)
+    """
+
+    value = value.strip()
+
+    if value.startswith("@"):
+        chat = await bot.get_chat(value)
+        return chat.id, f"https://t.me/{chat.username}"
+
+    if value.startswith("https://t.me/"):
+        username = value.replace("https://t.me/", "").split("/")[0]
+        chat = await bot.get_chat(f"@{username}")
+        return chat.id, f"https://t.me/{chat.username}"
+
+    if value.lstrip("-").isdigit():
+        chat = await bot.get_chat(int(value))
+        invite_link = (
+            f"https://t.me/{chat.username}"
+            if chat.username
+            else ""
+        )
+        return chat.id, invite_link
+
+    raise ValueError(
+        "Send a public channel username, numeric channel ID, or t.me link."
+    )
+
+
 @router.callback_query(F.data == "host_create")
 async def host_create(
     callback: CallbackQuery,
@@ -145,16 +181,43 @@ async def set_winners(message: Message, state: FSMContext):
     await state.set_state(CreateGiveaway.channel)
 
     await message.answer(
-        "5️⃣ Send a required channel username or invite link.\n\n"
+        "5️⃣ Send a required public channel:\n\n"
+        "<code>@yourchannel</code>\n\n"
+        "Or send a numeric channel ID:\n"
+        "<code>-1001234567890</code>\n\n"
         "Send <code>skip</code> to continue without a channel."
     )
 
 
 @router.message(CreateGiveaway.channel)
-async def set_channel(message: Message, state: FSMContext):
+async def set_channel(message: Message, state: FSMContext, bot: Bot):
     channel = clean_value(message.text, 200)
 
-    await state.update_data(channel=channel)
+    if channel:
+        try:
+            channel_id, invite_link = await resolve_channel(
+                bot,
+                channel,
+            )
+        except Exception:
+            return await message.answer(
+                "❌ Invalid channel.\n\n"
+                "Send a public channel username, numeric channel ID, "
+                "or t.me link.\n\n"
+                "Example:\n<code>@yourchannel</code>"
+            )
+
+        await state.update_data(
+            channel_id=channel_id,
+            channel_link=invite_link,
+        )
+
+    else:
+        await state.update_data(
+            channel_id=None,
+            channel_link="",
+        )
+
     await state.set_state(CreateGiveaway.chat)
 
     await message.answer(
@@ -228,7 +291,8 @@ async def finish_creation(
     prize = clean_value(data.get("prize"), 300)
     duration = data.get("duration")
     winners = data.get("winners")
-    channel = clean_value(data.get("channel"), 200)
+    channel_id = data.get("channel_id")
+    channel_link = data.get("channel_link") or ""
     chat = clean_value(data.get("chat"), 100)
     bio_bonus = clean_value(data.get("bio"), 100)
     name_bonus = clean_value(data.get("name"), 100)
@@ -283,7 +347,7 @@ async def finish_creation(
             name_bonus,
         )
 
-        if channel:
+        if channel_id:
             await connection.execute(
                 """
                 INSERT INTO giveaway_channels
@@ -293,9 +357,9 @@ async def finish_creation(
                 DO UPDATE SET link = $4
                 """,
                 giveaway_id,
-                channel,
-                channel,
-                channel,
+                channel_id,
+                str(channel_id),
+                channel_link,
             )
 
         await connection.execute(
@@ -573,7 +637,15 @@ async def add_channel(message: Message, command: CommandObject):
         )
 
     giveaway_id = int(args[0])
-    channel_id = int(args[1])
+
+    try:
+        channel_id = int(args[1])
+    except Exception:
+        return await message.answer(
+            "❌ CHANNEL_ID must be a numeric Telegram ID.\n"
+            "Example: -1001234567890"
+        )
+
     invite_link = args[2]
 
     async with db.pool.acquire() as connection:
@@ -614,7 +686,7 @@ async def add_channel(message: Message, command: CommandObject):
             """,
             giveaway_id,
             channel_id,
-            args[1],
+            str(channel_id),
             invite_link,
         )
 
@@ -853,4 +925,4 @@ async def draw_command(message: Message, command: CommandObject, bot: Bot):
             f"{index}. <code>{user_id}</code>"
             for index, user_id in enumerate(winners, 1)
         )
-        )
+    )
